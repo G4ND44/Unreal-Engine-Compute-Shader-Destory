@@ -1,0 +1,166 @@
+#include "/Engine/Public/Platform.ush"
+RWTexture2D<float> RWTimestamp;
+float Gametime;
+Texture2D<float> Timestamp;
+Texture2D<float4> PivotPainterOriginsExtent;
+float4x4 ObjectMatrix;
+float3 RayOrigin;
+float3 RayDirection;
+RWBuffer<uint> RWClosestHit;
+Buffer<uint> ClosestHit;
+float InverseSpreadDistance;
+float MaxDelay;
+float Seed;
+float3 InputHitPoint;
+RWTexture2D<float4> RWNormalAndRandom;
+RWBuffer<uint> RWChunksToDisableCount;
+RWBuffer<uint> RWChunksToDisable;
+
+float RaySphereIntersection(float3 Position, float Radius)
+{
+	float3 oc = RayOrigin - Position;
+
+	float a = dot(RayDirection,RayDirection);
+	float b = 2.0 * dot(oc,RayDirection);
+	float c = dot(oc, oc) - (Radius *Radius);
+
+	float discriminant = b * b - 4.0 * a * c;
+	float twoA = (2.0 * a);
+	if (discriminant > 0.0)
+	{
+		float sqrtDiscriminant =  sqrt(discriminant);
+	
+		// Two intersection points, choose the nearest one
+		float d1 = (-b - sqrtDiscriminant)/twoA;
+		float d2 = (-b + sqrtDiscriminant)/twoA;
+
+		float d = min(d1, d2);
+		return d;
+	}
+	else if (discriminant == 0.0)
+	{
+		// One intersection point
+		float d = -b /twoA;
+		return d;
+	}
+	else
+	{
+		return -1.0f;
+	}
+}
+uint Index2dTo1d(uint2 coords, uint Width)
+{
+	return Width * coords.y + coords.x;
+}
+float GetIntersectionDistance(float4 LocalPosExtent)
+{
+	float3 LocalPos = LocalPosExtent.xyz;
+	float3 WorldPos =  mul(float4(LocalPos, 1.0), ObjectMatrix).xyz;
+	float LocalRadius = LocalPosExtent.a * 0.5;
+	float3 LocalRadiusOnAxis = float3(LocalRadius, LocalRadius, LocalRadius);
+	float3 WorldRadiusOnAxis = mul(float4(LocalRadiusOnAxis.xyz, 0.0), ObjectMatrix).xyz;
+	float WorldRadius = max(max(WorldRadiusOnAxis.x,WorldRadiusOnAxis.y),WorldRadiusOnAxis.z);
+	return RaySphereIntersection(WorldPos,WorldRadius);
+}
+uint GetUintFromNormalizedFloat(float NormalizedValue)
+{
+	float ClampedFloat = clamp(NormalizedValue+1.0f,1.0f, asfloat(0x3fffffff));
+	uint MantissaBits = asuint(ClampedFloat);
+	MantissaBits &= 0x007fffff;
+	return MantissaBits;
+}
+float GetNormalizedFloatFromUint(uint MantissaBits)
+{
+	uint MantissaBitsWithExponent = MantissaBits;
+	MantissaBitsWithExponent&= 0x007fffff;
+	MantissaBitsWithExponent|= 0x3f800000;
+	float NormalizedValue = saturate(asfloat(MantissaBitsWithExponent) - 1.0f);
+	return NormalizedValue;
+}
+void AnimateChunksFromHitPoint(uint3 SampleCoords,uint Width, float3 HitPoint)
+{
+	float4 LocalPosExtent = PivotPainterOriginsExtent.Load(SampleCoords);
+	float3 LocalPos = LocalPosExtent.xyz;
+	float3 WorldPos =  mul(float4(LocalPos, 1.0), ObjectMatrix).xyz;
+	float DistanceToHit = distance(WorldPos,HitPoint);
+	float ScaledDistance = DistanceToHit * InverseSpreadDistance; // InverseSpreadDistance = 1.0/SpreadDistance
+	if(ScaledDistance<1.0f)
+	{
+		float3 RayDir = normalize(RayDirection);
+		float3 OffestedHitPos = HitPoint + RayDir*10.0;
+		float3 VectorToCenter = (WorldPos -OffestedHitPos);
+		float3 RayInverseDir = RayDir *(-1.0);
+		float3 DirToCenter= normalize(VectorToCenter);
+		float DotDir = abs(dot(DirToCenter,RayInverseDir));
+		float3 ExplodeNormal = normalize(lerp(DirToCenter,RayInverseDir,saturate(DotDir*DotDir)*0.5+0.5))  * 0.5 + float3(0.5,0.5,0.5); // packed explode normal
+		float RandomFloat = frac(sin(dot(WorldPos, float3(Gametime, 10820.82f, Seed)))*46158.155323f);
+		uint IndexBefore;
+		InterlockedAdd(RWChunksToDisableCount[0],1,IndexBefore);
+		RWChunksToDisable[IndexBefore] = Index2dTo1d(SampleCoords.xy,Width);
+		RWNormalAndRandom[SampleCoords.xy] = float4(ExplodeNormal.x,ExplodeNormal.y,ExplodeNormal.z,RandomFloat);
+		RWTimestamp[SampleCoords.xy] = Gametime+MaxDelay*ScaledDistance;
+	}
+		
+}
+[numthreads(1, 1, 1)]
+void PivotPainterDestroyResetBuffers()
+{
+	RWClosestHit[0] = 0;
+	RWChunksToDisableCount[0] = 0;
+}
+[numthreads(THREADS_X_SHADER0, THREADS_Y_SHADER0, THREADS_Z_SHADER0)]
+void PivotPainterDestroyFindClosestHit(
+	uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	uint Width;
+	uint Height;
+	Timestamp.GetDimensions(Width, Height);
+	if( DispatchThreadId.x >= Width ||  DispatchThreadId.y>= Height)
+		return;
+	uint3 SampleCoords = uint3(DispatchThreadId.xy, 0);
+	float PrevTime =  Timestamp.Load(SampleCoords).r;
+	if(PrevTime != 0.0f)
+		return;
+	float4 LocalPosExtent = PivotPainterOriginsExtent.Load(SampleCoords);
+	float HitDistance = GetIntersectionDistance(LocalPosExtent);
+	if( HitDistance <= 0.0 || HitDistance > 1.0f)
+		return;
+	float NormalizedDistance =1.0 - saturate(HitDistance);
+	// we are adding one to index so wi will know if index is 0 == not valid
+	InterlockedMax(RWClosestHit[0],GetUintFromNormalizedFloat(NormalizedDistance) + 1); 
+}
+[numthreads(THREADS_X_SHADER1, THREADS_Y_SHADER1, THREADS_Z_SHADER1)]
+void PivotPainterDestroyAnimateChunks(
+uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+	if(ClosestHit[0] == 0)
+		return;
+	uint Width;
+	uint Height;
+	Timestamp.GetDimensions(Width, Height);
+	if( DispatchThreadId.x >= Width ||  DispatchThreadId.y>= Height)
+		return;
+	uint3 SampleCoords = uint3(DispatchThreadId.xy, 0);
+	float PrevTime =  Timestamp.Load(SampleCoords).r;
+	if(PrevTime != 0.0f)
+		return;
+	float NormalizedDistance =  1.0f - GetNormalizedFloatFromUint(ClosestHit[0] - (uint)1);
+	float3 HitPoint = RayOrigin + RayDirection * NormalizedDistance;
+	AnimateChunksFromHitPoint(SampleCoords,Width,HitPoint);
+}
+[numthreads(THREADS_X_SHADER2, THREADS_Y_SHADER2, THREADS_Z_SHADER2)]
+void PivotPainterDestroyAnimateChunksByHitPoint(
+uint3 DispatchThreadId : SV_DispatchThreadID )
+{
+
+	uint Width;
+	uint Height;
+	Timestamp.GetDimensions(Width, Height);
+	if( DispatchThreadId.x >= Width ||  DispatchThreadId.y>= Height)
+		return;
+	uint3 SampleCoords = uint3(DispatchThreadId.xy, 0);
+	float PrevTime =  Timestamp.Load(SampleCoords).r;
+	if(PrevTime != 0.0f)
+		return;
+	AnimateChunksFromHitPoint(SampleCoords,Width,InputHitPoint);
+}
